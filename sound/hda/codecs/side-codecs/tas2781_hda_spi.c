@@ -2,7 +2,7 @@
 //
 // TAS2781 HDA SPI driver
 //
-// Copyright 2024 - 2025 Texas Instruments, Inc.
+// Copyright 2024 - 2026 Texas Instruments, Inc.
 //
 // Author: Baojun Xu <baojun.xu@ti.com>
 
@@ -41,9 +41,6 @@
 #define TASDEVICE_RANGE_MAX_SIZE	(256 * 128)
 #define TASDEVICE_WIN_LEN		128
 #define TAS2781_SPI_MAX_FREQ		(4 * HZ_PER_MHZ)
-/* Flag of calibration registers address. */
-#define TASDEVICE_CALIBRATION_REG_ADDRESS	BIT(7)
-#define TASDEV_UEFI_CALI_REG_ADDR_FLG	BIT(7)
 
 /* System Reset Check Register */
 #define TAS2781_REG_CLK_CONFIG		TASDEVICE_REG(0x0, 0x0, 0x5c)
@@ -729,6 +726,9 @@ static int tas2781_hda_bind(struct device *dev, struct device *master,
 		tasdev_fw_ready);
 	if (!ret)
 		comp->playback_hook = tas2781_hda_playback_hook;
+
+	/* Only HP Laptop support SPI-based TAS2781 */
+	tas_hda->catlog_id = HP;
 
 	return ret;
 }
