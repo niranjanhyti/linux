@@ -28,9 +28,10 @@
 #include <sound/jack.h>
 #include <linux/unaligned.h>
 
+#include "../../../drivers/soundwire/bus.h"
 #include "tac5xx2.h"
 
-#define TAC5XX2_PROBE_TIMEOUT_MS 3000
+#define TAC5XX2_PROBE_TIMEOUT_MS 5000
 #define TAC5XX2_FW_CACHE_TIMEOUT_MS 300
 
 #define TAC5XX2_DEVICE_RATES (SNDRV_PCM_RATE_44100 | \
@@ -1549,6 +1550,86 @@ static s32 tac_fw_get_next_file(const u8 *data, size_t data_size, struct tac_fw_
 	return file_length + sizeof(u32) * 5;
 }
 
+/* Check if device supports BPT (Block Protocol Transfer) firmware download */
+static bool tac_bpt_supported(struct tac5xx2_prv *tac_dev)
+{
+	struct sdw_slave *slave = tac_dev->sdw_peripheral;
+	struct sdw_bus *bus = slave->bus;
+
+	return bus && bus->ops && bus->ops->bpt_send_async;
+}
+
+/* Download firmware using BPT (Block Protocol Transfer) for optimal performance */
+static s32 tac_download_bpt(struct tac5xx2_prv *tac_dev,
+			    struct tac_fw_file *files, int num_files)
+{
+	struct sdw_slave *slave = tac_dev->sdw_peripheral;
+	struct sdw_bus *bus = slave->bus;
+	struct sdw_bpt_msg msg = {0};
+	struct sdw_bpt_section *sections;
+	int i, ret;
+	int btp_idx = 0;
+
+	sections = kcalloc(num_files, sizeof(*sections), GFP_KERNEL);
+	if (!sections)
+		return -ENOMEM;
+
+	for (i = 0; i < num_files; i++) {
+		if (files[i].length <= 72) {
+			dev_dbg(tac_dev->dev,
+				"Section %d: using single write (addr=0x%x, len=%d)\n",
+				i, files[i].dest_addr, files[i].length);
+			ret = sdw_nwrite_no_pm(slave, files[i].dest_addr,
+					files[i].length, files[i].fw_data);
+			if (ret < 0) {
+				dev_err(tac_dev->dev,
+					"single write err: i=%d addr=%#x len=%d ret=%d\n",
+					i, files[i].dest_addr, files[i].length, ret);
+				return ret;
+			}
+		} else {
+			sections[btp_idx].addr = files[i].dest_addr;
+			sections[btp_idx].len = files[i].length;
+			sections[btp_idx].buf = files[i].fw_data;
+			btp_idx++;
+			dev_dbg(tac_dev->dev, "BPT section %d: addr=0x%x len=%d\n",
+				btp_idx, files[i].dest_addr, files[i].length);
+		}
+	}
+
+	msg.sec = sections;
+	msg.sections = btp_idx;
+	msg.dev_num = slave->dev_num;
+	msg.flags = SDW_MSG_FLAG_WRITE;
+
+	dev_dbg(tac_dev->dev, "BPT starting: %d sections, dev_num=%d\n",
+		btp_idx, slave->dev_num);
+
+	//mutex_lock(&tac_dev->pde_lock);
+
+	/* below is the workaround for deadlock,
+	 * as sdw_dev_lock will be held by status
+	 * as well as bpt_send_sync
+	 */
+	if (mutex_is_locked(&slave->sdw_dev_lock)) {
+		mutex_unlock(&slave->sdw_dev_lock);
+		ret = sdw_bpt_send_sync(bus, slave, &msg);
+		mutex_lock(&slave->sdw_dev_lock);
+	} else {
+		ret = sdw_bpt_send_sync(bus, slave, &msg);
+	}
+	//mutex_unlock(&tac_dev->pde_lock);
+
+	if (ret < 0)
+		dev_err(tac_dev->dev, "BPT firmware download failed: %d\n", ret);
+	else
+		dev_dbg(tac_dev->dev, "BPT firmware download complete: %d sections\n",
+			num_files);
+
+	kfree(sections);
+	return ret;
+}
+
 static void tac5xx2_fw_ready(const struct firmware *fmw, void *context)
 {
 	s32 ret = 0;
@@ -1643,6 +1724,17 @@ static int tac_download(struct tac5xx2_prv *tac_dev)
 	u32 i;
 	struct tac_fw_file *files = tac_dev->fw_files;
 	u32 num_files = tac_dev->fw_file_cnt;
+
+	/* Try BPT first if supported, fallback to legacy method */
+	if (tac_bpt_supported(tac_dev)) {
+		ret = tac_download_bpt(tac_dev, files, num_files);
+		if (ret == 0) {
+			dev_info(tac_dev->dev, "Firmware downloaded via BPT\n");
+			return ret;
+		}
+		dev_warn(tac_dev->dev,
+			 "BPT failed (%d), falling back to standard method\n", ret);
+	}
 
 	for (i = 0; i < num_files; i++) {
 		ret = sdw_nwrite_no_pm(tac_dev->sdw_peripheral, files[i].dest_addr,
